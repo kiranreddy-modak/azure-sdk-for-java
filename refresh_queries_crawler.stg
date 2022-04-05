@@ -1,0 +1,2040 @@
+getSchedulerInfo()::=<<
+select
+jsd.refresh_frequency as cronPattern,
+'crawler_source_id_'||dp.dataplace_id||'_'||dp.dataplace_component_type_id as group,
+'crawler_source_id_'||dp.dataplace_id||'_'||dp.dataplace_component_type_id as job_key,
+'crawler_source_id_'||dp.dataplace_id||'_'||dp.dataplace_component_type_id as trigger_key,
+refresh_frequency ,additional_properties->'crawl_frequency'->\>'cron_freq' as cron_freq,
+jsd.job_schedule_id,dp.dataplace_id,jsd.job_type_id,
+additional_properties->'crawl_frequency'->\>'cron_type' as cron_type
+,additional_properties->'crawl_frequency'->\>'cron_timezone' as timezone
+,(additional_properties->'crawl_frequency'->\>'consider_timezone')::boolean as consider_timezone
+,replace(((additional_properties->'crawl_frequency'->\>'cron_info')::json->'schedule_type')::text,'"','') as schedule_type
+,replace(((additional_properties->'crawl_frequency'->\>'cron_info')::json->'start_date')::text,'"','') as start_date
+,replace(((additional_properties->'crawl_frequency'->\>'cron_info')::json->'end_date')::text,'"','') as end_date
+,'CrawlerMessagesPublisher' as publisher_class_name
+from nabu.dataplace_physical dp
+inner join nabu.job_schedule_details jsd
+on jsd.dataplace_id = dp.dataplace_id
+where dp.is_active = true
+and dp.valid_to_ts = '9999-12-31'
+and jsd.valid_to_ts = '9999-12-31'
+and (additional_properties->'crawl_frequency'->\>'consider_timezone') <> ''
+>>
+
+getJobData(data)::=<<
+select dp.dataplace_name,dp.dataplace_info as source_info,dp.dataplace_id,dp.dataplace_component_type_id,
+'crawler_source_id_'||dp.dataplace_id||'_'||dp.dataplace_component_type_id as group,
+'crawler_source_id_'||dp.dataplace_id||'_'||dp.dataplace_component_type_id as job_key,
+'crawler_source_id_'||dp.dataplace_id||'_'||dp.dataplace_component_type_id as trigger_key,
+dp.is_active,dp.is_sensitive,dscl.dataplace_sub_component_type as source_type ,dscl.additional_info,
+CAST(to_char(current_timestamp, 'YYYYMMDDHH24MI') AS numeric(18,0)) || dp.dataplace_id::text as crawl_instance_id,
+ci.credential_type_id,ci.credential_id,
+'refresh_queries_crawler|crawler' as output_template_group,
+'generate_initial_message_'||dscl.dataplace_sub_component_type as output_template_name,
+'crawling_source_details' as scheduler_bot_template,
+'refresh_queries_crawler|crawler' as bot_template_group,
+ct.credential_type
+from nabu.dataplace_physical dp
+inner join nabu.job_schedule_details jsd
+on jsd.dataplace_id = dp.dataplace_id
+inner join nabu.dataplace_sub_component_lookup dscl
+on dp.dataplace_sub_component_id = dscl.dataplace_sub_component_id
+left outer join nabu.credential_info ci
+on dp.credential_id = ci.credential_id
+left outer join nabu.credential_type_lookup ct
+on ci.credential_type_id  = ct.credential_type_id
+where dp.is_active = true
+and dp.valid_to_ts = '9999-12-31'
+ and jsd.valid_to_ts = '9999-12-31'
+and (additional_properties->'crawl_frequency'->\>'consider_timezone') <> ''
+and jsd.dataplace_id =$data.dataplace_id$
+and jsd.job_type_id =$data.job_type_id$
+>>
+
+
+valid_job(data)::=<<
+select valid_to_ts::text from nabu.dataplace_physical
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$;
+>>
+
+getCreds()::=<<
+with fireshotsconfig as (
+select convert_from(decode(configuration->\>'encodedConfigs','base64'), 'UTF8')  as encodedconfigs,  1 as id
+from nabu_ui.fireshots_service_details
+where service_type = 'fireshots' and valid_to_ts='9999-12-31'
+), redisconfig as (
+select convert_from(decode(configuration->\>'encodedConfigs','base64'), 'UTF8')  as encodedconfigs, 1 as id
+from nabu_ui.fireshots_service_details
+where service_type = 'redis' and valid_to_ts='9999-12-31'
+), credentialsconfig as (
+select convert_from(decode(configuration->\>'encodedConfigs','base64'), 'UTF8')  as encodedconfigs, 1 as id
+from nabu_ui.fireshots_service_details
+where service_type = 'credentialsFetchWebService' and valid_to_ts='9999-12-31'
+),
+jwt_ttl as (
+select *, 1 as id from nabu.authtoken_expiration
+)
+select f.encodedconfigs::json->\>'host' as host,f.encodedconfigs::json->\>'port' as port, j.jwt_ttl as jwt_ttl,
+(r.encodedconfigs::json->\>'encryption')::text as encrypted_password ,'fireshots/credentialsFetchWebService' as endpoint,'' as userpass,
+r.encodedconfigs::json->\>'redis_url' as redisURL,r.encodedconfigs::json->\>'password' as password,
+c.encodedconfigs::json->\>'user_id' as userid,
+f.encodedconfigs::json->\>'public_key_file_path' as publickey,f.encodedconfigs::json->\>'private_key_file_path' as privateKey
+from fireshotsconfig f
+inner join redisconfig r
+on f.id = r.id
+inner join credentialsconfig c
+on c.id = r.id
+inner join jwt_ttl j
+on c.id = j.id
+>>
+
+specialSrcHandler(data)::=<<
+select schema_name from nabu.dataplace_relational_component_physical
+ where dataplace_id = $data.dataplace_id$
+ and dataplace_component_type_id = $data.dataplace_component_type_id$
+ and is_active = true
+ and valid_to_ts = '9999-12-31';
+>>
+
+
+insertInformSchema(data)::=<<
+insert into nabu.dataplace_relational_component_physical(schema_name,dataplace_id,dataplace_component_type_id,is_active,is_sensitive,valid_from_ts,valid_to_ts)
+values ('$data.schema_name$',$data.dataplace_id$,$data.dataplace_component_type_id$,$data.is_active$,$data.is_sensitive$,
+now(),'9999-12-31');
+>>
+
+inactivateSource(data)::=<<
+update nabu.dataplace_relational_component_physical
+set is_active = false,valid_to_ts = current_timestamp
+where schema_name = '$data.schema_name$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and is_active = true
+and valid_to_ts = '9999-12-31';
+
+update nabu.dataplace_table_metadata_physical
+set valid_to_ts = current_timestamp
+where schema_name = '$data.schema_name$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$;
+
+update nabu.dataplace_column_metadata_physical
+set valid_to_ts = current_timestamp
+where schema_name = '$data.schema_name$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$;
+
+update nabu.dataplace_index_column
+set valid_to_ts = current_timestamp
+where schema_name = '$data.schema_name$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$;
+
+update nabu.dataplace_table_privileges
+set valid_to_ts = current_timestamp
+where schema_name = '$data.schema_name$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$;
+
+update nabu.table_metadata_estimated_rows
+set valid_to_ts = current_timestamp
+where schema_id in
+(select schema_id from nabu.dataplace_relational_component
+where schema_name = '$data.schema_name$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$);
+>>
+
+queryFilterConditionForSchemas(data)::=<<
+select
+case
+when a.filter_type ='Where IN clause' then 'schema_name in '||'('||''''||REPLACE(a.filter_rule,',',''',''')||''''||')'
+when a.filter_type ='Where NOT IN clause' then 'schema_name not in '||'('||''''||REPLACE(a.filter_rule,',',''',''')||''''||')'
+when a.filter_type = 'Inclusive Regex' then 'schema_name ~* '''||regexp_replace(a.filter_rule::text,'\[|\]|"'::text,''::text,'g')||''''
+when a.filter_type = 'Exclusive Regex' then 'schema_name !~* '''||regexp_replace(a.filter_rule::text,'\[|\]|"'::text,''::text,'g')||''''
+when a.filter_type = 'Inclusive Like' then 'schema_name like ''%'||regexp_replace(a.filter_rule::text,'\[|\]|"'::text,''::text,'g')||'%'''
+when a.filter_type = 'Exclusive Like' then 'schema_name not like ''%'||regexp_replace(a.filter_rule::text,'\[|\]|"'::text,''::text,'g')||'%'''
+end as condition,
+a.filter_enabled as filter_enabled
+from
+(select
+((dataplace_info->'filter_list')::json#>\>'{0}')::json->\>'filter_type' as filter_type,
+(((dataplace_info->'filter_list')::json#>\>'{0}')::json->\>'filter_value') as filter_rule,
+(dataplace_info->\>'filters_enabled')::bool as filter_enabled
+from nabu.dataplace_physical where dataplace_id = $data.dataplace_id$)a
+>>
+
+getSchemasList(data)::=<<
+with tmp_Schemas as (
+select '$data.firstSchema$' as  schema_name
+$data.schemasList:{x | $generateSelectStatements(x)$};separator="\n"$)
+select schema_name from tmp_Schemas where $data.condition$
+>>
+
+generateSelectStatements(x)::=<<
+union all
+select '$x$' as  schema_name
+>>
+
+noCrawlingSchemaList(data)::=<<
+information_schema,pg_catalog,pg_temp_1,pg_toast,pg_toast_temp_1,sqlj,staging,db_accessadmin,db_backupoperator,db_datareader,db_datawriter,db_ddladmin,db_denydatareader,db_denydatawriter,db_owner,db_securityadmin,guest,INFORMATION_SCHEMA,sys,ANONYMOUS,APPQOSSYS,AUDSYS,CTXSYS,DBSFWUSER,DBSNMP,DIP,DVF,DVSYS,GGSYS,GSMCATUSER,GSMUSER,HR,LBACSYS,MDDATA,MDSYS,OJVMSYS,OLAPSYS,ORACLE_OCM,ORDDATA,ORDPLUGINS,ORDSYS,GSMADMIN_INTERNAL,OUTLN,REMOTE_SCHEDULER_AGENT,RETAIL,SI_INFORMTN_SCHEMA,SPATIAL_CSW_ADMIN_USR,SYS,SYS\$UMF,SYSBACKUP,SYSDG,SYSKM,SYSRAC,SYSTEM,WMSYS,XDB,XS\$NULL,pg_internal,APEX_030200,APEX_PUBLIC_USER,BI,EXFSYS,FLOWS_FILES,IX,MGMT_VIEW,OE,OWBSYS,OWBSYS_AUDIT,PM,SCOTT,SH,SPATIAL_WFS_ADMIN_USR,SYSMAN,SYSTEM,DEFINITION_SCHEMA,APEX_040200,SYSSTAT,SYSPUBLIC,SYSPROC,SYSIBMTS,SYSIBMINTERNAL,SYSIBMADM,SYSIBM,SYSFUN,SYSCAT,SQLJ,NULLID,default,DEFAULT,SYSTOOLS,_SYS_AFL,_SYS_BI,_SYS_DI,_SYS_EPM,_SYS_PLAN_STABILITY,_SYS_SQL_ANALYZER,_SYS_STATISTICS,_SYS_TASK,_SYS_DI#BROKER_CG,_SYS_SECURITY,SAP_PA_APL,_SYS_DI_CATALOG,PAL_STEM_SCHEMA,_SYS_DI_BI_CATALOG,_SYS_EPM_DATA,_SYS_DI_SEARCH_CATALOG,_SYS_TABLE_REPLICAS,_SYS_DI_SU,_SYS_WORKLOAD_REPLAY,_SYS_AUDIT,BROKER_PO_USER,BROKER_USER,_SYS_TABLE_REPLICA_DATA,_SYS_DI_TO,_SYS_LDB,_SYS_DATA_ANONYMIZATION
+>>
+
+getSources(data)::=<<
+select schema_name,schema_id
+from nabu.dataplace_relational_component_physical
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and is_active = true
+and valid_to_ts = '9999-12-31';
+>>
+
+getBatchSources(data)::=<<
+with schema_count as (
+select count(*) as schema_count , dataplace_id, dataplace_component_type_id from nabu.dataplace_relational_component_physical
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id =$data.dataplace_component_type_id$ and valid_to_ts ='9999-12-31' and is_active = true
+group by dataplace_id , dataplace_component_type_id
+)
+select string_agg(schema_name_2,',' )as schema_list , string_agg(schema_id::varchar,',') as schema_id_list,batch_id, dataplace_id , dataplace_component_type_id from
+(select rc.dataplace_id,rc.dataplace_component_type_id ,rc.schema_id,case when sc.schema_count >= 500 then mod(schema_id , (sc.schema_count/100)::int) else 0 end as batch_id ,
+'''' || schema_name || '''' as schema_name_2 from nabu.dataplace_relational_component_physical rc
+inner join schema_count sc
+on sc.dataplace_id = rc.dataplace_id
+and sc.dataplace_component_type_id = rc.dataplace_component_type_id
+where rc.dataplace_id = $data.dataplace_id$
+and rc.dataplace_component_type_id =$data.dataplace_component_type_id$
+and valid_to_ts = '9999-12-31' and is_active = true)a
+group by batch_id,dataplace_id , dataplace_component_type_id
+>>
+
+getDirectories(data)::=<<
+select directory_name, root_location_path, directory_path
+from nabu.dataplace_file_system_component
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and is_active = true
+and valid_to_ts = '9999-12-31';
+>>
+
+get_path_from_dataplace_file_system_component(data)::=<<
+select directory_path
+from nabu.dataplace_file_system_component
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and is_active = true
+and valid_to_ts = '9999-12-31';
+>>
+
+insertDirectory(data)::=<<
+insert into nabu.dataplace_file_system_component(dataplace_id,dataplace_component_type_id,directory_name,root_location_path,is_active,is_sensitive,directory_path,valid_from_ts,valid_to_ts)
+values ($data.dataplace_id$,$data.dataplace_component_type_id$,'$data.directory_name$','$data.root_location_path$',$data.is_active$,$data.is_sensitive$,'$data.directory_path$',now(),'9999-12-31');
+>>
+
+inactivateDirectory(data)::=<<
+update nabu.dataplace_file_system_component
+set is_active = false,valid_to_ts = current_timestamp
+where directory_name = '$data.directory_name$'
+and root_location_path = '$data.root_location_path$'
+and directory_path = '$data.directory_path$'
+and dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and is_active = true
+and valid_to_ts = '9999-12-31';
+
+update nabu.dataplace_file_metadata
+set valid_to_ts = current_timestamp
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and valid_to_ts = '9999-12-31';
+
+update nabu.dataplace_file_sharepoint_metadata
+set valid_to_ts = current_timestamp
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and valid_to_ts = '9999-12-31';
+
+update nabu.dataplace_semi_structured_column_metadata
+set valid_to_ts = current_timestamp
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and valid_to_ts = '9999-12-31';
+>>
+
+getCloudSources(data)::=<<
+select directory_id from nabu.dataplace_file_system_component
+where dataplace_id = $data.dataplace_id$
+and dataplace_component_type_id = $data.dataplace_component_type_id$
+and is_active = true
+and valid_to_ts = '9999-12-31';
+>>
+
+retry_intervals()::=<<
+[
+]
+>>
+
+getCredentialTypeId(data)::=<<
+select credential_type_id from nabu.credential_info where credential_id = $data.credential_id$;
+>>
+
+insert_into_dataplace_pre_aggregate_stats(data)::=<<
+with dataplace_crawl_details as (
+	select x.dataplace_id,crawl_instance_id, dataplace_component_type_id, dataplace_sub_component_id ,metadata_category ,end_ts
+	from (
+	select  c.dataplace_id, c.dataplace_component_type_id, c.dataplace_sub_component_id ,e.metadata_category
+	from nabu.dataplace_physical c
+				   inner join nabu.dataplace_component_mapping_lookup e on c.dataplace_component_type_id = e.dataplace_component_type_id
+	and e.dataplace_sub_component_id =  c.dataplace_sub_component_id and c.valid_to_ts = '9999-12-31'
+	and dataplace_id = $data.dataplace_id$
+
+	) x,
+	(select dataplace_id,crawl_instance_id,end_ts
+	from (
+		select cx.dataplace_id,crawl_instance_id, coalesce(cx.end_ts,cx.start_ts) as end_ts,
+		row_number() over (partition by cx.dataplace_id order by coalesce(cx.end_ts,cx.valid_to_ts) desc) as rownum
+		from (select * from nabu.dataplace_physical where valid_to_ts = '9999-12-31') dp
+		inner join (select * from nabu.crawling_status where status_code_id in (26) and valid_to_ts = '9999-12-31' )cx
+		on cx.dataplace_id =dp.dataplace_id
+		 and cx.dataplace_id = $data.dataplace_id$
+		) t
+	where rownum = 1 -- Mostly the valid_to_ts = 9999-12-31 covers the latest but just incase we have some issues
+	) y
+where x.dataplace_id = y.dataplace_id
+),
+
+table_details as ( select a.dataplace_id, count(b.table_id) as tables_count, coalesce(sum( case when b.table_size <= 0 then 0 else b.table_size end),0) as table_size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_table_metadata_physical b
+where  a.dataplace_id = b.dataplace_id  and b.valid_to_ts = '9999-12-31' and b.table_type = 'T'
+and a.metadata_category = 'relational'
+group by 1 ),
+
+
+view_details as ( select a.dataplace_id, count(b.table_id) as views_count, coalesce(sum( case when b.table_size <= 0 then 0 else b.table_size end),0) as view_size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_table_metadata_physical b
+where  a.dataplace_id = b.dataplace_id  and b.valid_to_ts = '9999-12-31' and b.table_type in ('V', 'M')
+and a.metadata_category = 'relational'
+group by 1  ),
+
+
+column_details as ( select a.dataplace_id, count(b.column_id) as columns_count
+from dataplace_crawl_details a, nabu.dataplace_column_metadata_physical b
+where  a.dataplace_id = b.dataplace_id  and b.valid_to_ts = '9999-12-31'
+and a.metadata_category = 'relational'
+group by 1 ),
+
+file_details as(
+select dataplace_id, coalesce(sum(file_objects),0) as files_count, coalesce(sum(size_in_bytes),0) as file_size_in_bytes
+from (
+select a.dataplace_id ,coalesce(count(b.file_id),0) as file_objects, coalesce(sum(b.size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'file' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id
+union all
+
+select a.dataplace_id ,coalesce(count(file_id),0) as file_objects, coalesce(sum(b.file_size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_sharepoint_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'sharepoint' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id
+union all
+
+select a.dataplace_id ,coalesce(count(file_id),0) as file_objects, coalesce(sum(b.file_size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_documentum_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'documentum' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id
+union all
+
+select a.dataplace_id ,coalesce(count(file_id),0) as file_objects, coalesce(sum(b.file_size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_drive_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'file' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id) x
+
+group by dataplace_id
+)
+,collection_details as(
+select a.dataplace_id, coalesce(sum(cm.collection_size),0) as estimated_size_collections,
+count( cm.collection_id) as collections_count
+from dataplace_crawl_details a
+inner join nabu.dataplace_collection_metadata cm on a.dataplace_id = cm.dataplace_id and cm.valid_to_ts = '9999-12-31'
+and a.metadata_category in ( 'collection' )
+group by a.dataplace_id
+)
+
+,field_details as(
+select a.dataplace_id, coalesce (count(c.field_id),0) as fields_count
+from dataplace_crawl_details a
+inner join nabu.dataplace_collection_field_metadata c on a.dataplace_id = c.dataplace_id and c.valid_to_ts = '9999-12-31'
+and a.metadata_category in ( 'collection' )
+group by a.dataplace_id
+)
+
+insert into nabu_ui.crawling_pre_aggregate_stats(dataplace_id, crawl_instance_id, tables_count, views_count,
+collections_count, files_count, columns_count, fields_count, objects_size, crt_ts)
+select  a.dataplace_id, crawl_instance_id,  coalesce(b.tables_count,0) as tables_count, coalesce(c.views_count,0) as views_count, coalesce(d.collections_count,0) as collections_count, coalesce(e.files_count,0) as files_count, coalesce(f.columns_count,0) as columns_count, coalesce(g.fields_count,0) as fields_count,
+ coalesce(estimated_size_collections,0) + coalesce(file_size_in_bytes,0) + coalesce(table_size_in_bytes,0) + coalesce(view_size_in_bytes,0) as objects_size, a.end_ts + interval '60 seconds' as crt_ts
+from dataplace_crawl_details a left outer join table_details b on a.dataplace_id = b.dataplace_id
+left outer join view_details c on a.dataplace_id = c.dataplace_id
+left outer join collection_details d on a.dataplace_id = d.dataplace_id
+left outer join file_details e on a.dataplace_id = e.dataplace_id
+left outer join column_details f on a.dataplace_id = f.dataplace_id
+left outer join field_details g on a.dataplace_id = g.dataplace_id
+;
+>>
+
+insert_into_dataplace_archive_log(data)::=<<
+with dataplace_crawl_details as (
+	select x.dataplace_id,crawl_instance_id, dataplace_component_type_id, dataplace_sub_component_id ,metadata_category ,end_ts
+	from (
+	select  c.dataplace_id, c.dataplace_component_type_id, c.dataplace_sub_component_id ,e.metadata_category
+	from nabu.dataplace_physical c
+				   inner join nabu.dataplace_component_mapping_lookup e on c.dataplace_component_type_id = e.dataplace_component_type_id
+	and e.dataplace_sub_component_id =  c.dataplace_sub_component_id and c.valid_to_ts = '9999-12-31'
+	and dataplace_id = $data.dataplace_id$
+
+	) x,
+	(select dataplace_id,crawl_instance_id,end_ts
+	from (
+		select cx.dataplace_id,crawl_instance_id, coalesce(cx.end_ts,cx.start_ts) as end_ts,
+		row_number() over (partition by cx.dataplace_id order by coalesce(cx.end_ts,cx.valid_to_ts) desc) as rownum
+		from (select * from nabu.dataplace_physical where valid_to_ts = '9999-12-31') dp
+		inner join (select * from nabu.crawling_status where status_code_id in (26) and valid_to_ts = '9999-12-31' )cx
+		on cx.dataplace_id =dp.dataplace_id
+		 and cx.dataplace_id = $data.dataplace_id$
+		) t
+	where rownum = 1 -- Mostly the valid_to_ts = 9999-12-31 covers the latest but just incase we have some issues
+	) y
+where x.dataplace_id = y.dataplace_id
+),
+
+table_details as ( select a.dataplace_id, count(b.table_id) as tables_count, coalesce(sum( case when b.table_size <= 0 then 0 else b.table_size end),0) as table_size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_table_metadata_physical b
+where  a.dataplace_id = b.dataplace_id  and b.valid_to_ts = '9999-12-31' and b.table_type = 'T'
+and a.metadata_category = 'relational'
+group by 1 ),
+
+
+view_details as ( select a.dataplace_id, count(b.table_id) as views_count, coalesce(sum( case when b.table_size <= 0 then 0 else b.table_size end),0) as view_size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_table_metadata_physical b
+where  a.dataplace_id = b.dataplace_id  and b.valid_to_ts = '9999-12-31' and b.table_type in ('V', 'M')
+and a.metadata_category = 'relational'
+group by 1  ),
+
+
+column_details as ( select a.dataplace_id, count(b.column_id) as columns_count
+from dataplace_crawl_details a, nabu.dataplace_column_metadata_physical b
+where  a.dataplace_id = b.dataplace_id  and b.valid_to_ts = '9999-12-31'
+and a.metadata_category = 'relational'
+group by 1 ),
+
+file_details as(
+select dataplace_id, coalesce(sum(file_objects),0) as files_count, coalesce(sum(size_in_bytes),0) as file_size_in_bytes
+from (
+select a.dataplace_id ,coalesce(count(b.file_id),0) as file_objects, coalesce(sum(b.size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'file' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id
+union all
+
+select a.dataplace_id ,coalesce(count(file_id),0) as file_objects, coalesce(sum(b.file_size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_sharepoint_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'sharepoint' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id
+union all
+
+select a.dataplace_id ,coalesce(count(file_id),0) as file_objects, coalesce(sum(b.file_size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_documentum_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'documentum' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id
+union all
+
+select a.dataplace_id ,coalesce(count(file_id),0) as file_objects, coalesce(sum(b.file_size),0) as size_in_bytes
+from dataplace_crawl_details a, nabu.dataplace_file_drive_metadata b
+where a.dataplace_id = b.dataplace_id
+and b.dataplace_component_type_id in (2,3)
+and a.metadata_category in ( 'file' )
+and b.valid_to_ts = '9999-12-31'
+group by a.dataplace_id) x
+
+group by dataplace_id
+)
+,collection_details as(
+select a.dataplace_id, coalesce(sum(cm.collection_size),0) as estimated_size_collections,
+count( cm.collection_id) as collections_count
+from dataplace_crawl_details a
+inner join nabu.dataplace_collection_metadata cm on a.dataplace_id = cm.dataplace_id and cm.valid_to_ts = '9999-12-31'
+and a.metadata_category in ( 'collection' )
+group by a.dataplace_id
+)
+
+,field_details as(
+select a.dataplace_id, coalesce (count(c.field_id),0) as fields_count
+from dataplace_crawl_details a
+inner join nabu.dataplace_collection_field_metadata c on a.dataplace_id = c.dataplace_id and c.valid_to_ts = '9999-12-31'
+and a.metadata_category in ( 'collection' )
+group by a.dataplace_id
+)
+
+insert into nabu_ui.crawling_pre_aggregate_stats_archive_log(dataplace_id, crawl_instance_id, tables_count, views_count,
+collections_count, files_count, columns_count, fields_count, objects_size, crt_ts)
+select  a.dataplace_id, crawl_instance_id,  coalesce(b.tables_count,0) as tables_count, coalesce(c.views_count,0) as views_count, coalesce(d.collections_count,0) as collections_count, coalesce(e.files_count,0) as files_count, coalesce(f.columns_count,0) as columns_count, coalesce(g.fields_count,0) as fields_count,
+ coalesce(estimated_size_collections,0) + coalesce(file_size_in_bytes,0) + coalesce(table_size_in_bytes,0) + coalesce(view_size_in_bytes,0) as objects_size, a.end_ts + interval '60 seconds' as crt_ts
+from dataplace_crawl_details a left outer join table_details b on a.dataplace_id = b.dataplace_id
+left outer join view_details c on a.dataplace_id = c.dataplace_id
+left outer join collection_details d on a.dataplace_id = d.dataplace_id
+left outer join file_details e on a.dataplace_id = e.dataplace_id
+left outer join column_details f on a.dataplace_id = f.dataplace_id
+left outer join field_details g on a.dataplace_id = g.dataplace_id
+;
+>>
+
+delete_from_dataplace_pre_aggregate_stats(data)::=<<
+with rows_to_be_deleted as
+( select dataplace_id , pre_aggregate_id, crt_ts, rownum
+from ( select dataplace_id, pre_aggregate_id ,crt_ts, row_number() over (partition by dataplace_id order by crt_ts desc) as rownum
+from nabu_ui.crawling_pre_aggregate_stats
+where dataplace_id = $data.dataplace_id$ ) A
+where rownum > 5
+)
+-- select * from rows_to_be_deleted
+
+delete from nabu_ui.crawling_pre_aggregate_stats
+where (dataplace_id, pre_aggregate_id)
+in (select dataplace_id, pre_aggregate_id from rows_to_be_deleted)
+>>
+
+crawling_source_details(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_name": "SparkScriptBot",
+  "bot_metadata": {
+    "message_topic": "$dataAsMap.bot_topic$",
+    "message_id": "$message_id$",
+    "bot_id": "$bot_id$",
+    "parent_id": "$dataAsMap.parent_id$",
+    "tags": {
+      "process_id": $dataAsMap.process_id$,
+      "initial_ts": $dataAsMap.initial_ts$,
+      "generated_ts": $dataAsMap.generated_ts$,
+      "batch_id":$dataAsMap.batch_id$,
+      "environment": "",
+      "tags": [
+        "ScriptBot"
+      ],
+      "task_dependency": true
+    },
+      "task_retry_intervals_secs": $retry_intervals()$,
+      "message_context": "file_mount"
+    },
+  "bot_tasks": [
+    {
+      "task_name": "file_mount",
+      "data_processor": {
+        "classname": "com.modak.bots.processor.NullProcessor",
+        "props": {}
+      },
+      "app_template_details": {
+        "template_group": "mount_unmount_template|crawler",
+        "template_name": "mount_script"
+      },
+      "input_data": {
+            "topic":"$dataAsMap.topic$",
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "source_info_details":$dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className":"com.modak.spiderweb.crawlers.UnixCrawler",
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+      },
+      "output_message_templates": [
+         {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "$dataAsMap.output_template_name$_from_ScriptBot",
+          "useIncomingData":true
+         }
+      ],
+      "error_message_templates": [
+        {
+          "template_group": "ingestion_flow|ingestion",
+          "template_name": "error_template_create_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+crawler_status_msg(data,message_uuid,process_id,initial_ts,batch_id,batch_name)::=<<
+{
+  "bot_name": "SparkScriptBot",
+  "bot_metadata": {
+    "message_topic": "$data.topic$",
+    "message_id": "$message_uuid$",
+    "bot_id": "e035080f-88d6-4fdb-a318-a1ad0f1a8cc9",
+    "parent_id": "e035080f-88d6-4fdb-a318-a1ad0f1a8cc9",
+    "tags": {
+      "process_id": $data.process_id$,
+      "initial_ts": $data.process_id$,
+      "generated_ts": $data.process_id$,
+      "batch_id":$data.batch_id$,
+      "environment": "modak",
+      "tags": [
+        "ScriptBot"
+      ],
+      "task_dependency": true
+    },
+      "task_retry_intervals_secs": $retry_intervals()$,
+      "message_context": "file_unmount"  },
+  "bot_tasks": [
+    {
+      "task_name": "file_unmount",
+      "data_processor": {
+        "classname": "com.modak.bots.processor.NullProcessor",
+        "props": {}
+      },
+      "app_template_details": {
+        "template_group": "mount_unmount_template|crawler",
+        "template_name": "unmount_script"
+      },
+      "input_data": {
+          "status":"$data.status$",
+          "source_info":"$data.source_info$"
+      },
+      "output_message_templates": [
+      ],
+      "error_message_templates": [
+        {
+          "template_group": "ingestion_flow|ingestion",
+          "template_name": "error_template_create_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+
+generate_initial_message_postgres(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic":"$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:postgresql://host_name/database_name",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.PostgresCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+          },
+          "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+          }
+        },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+
+
+generate_initial_message_mysql(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:mysql://host_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.MySqlCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_sql_server(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:jtds:sqlserver://host_name/database_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.SqlServerCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+
+generate_initial_message_oracle(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:oracle:thin:@host_name:database_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.OracleCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_hive(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "isEncrypted":"N",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "className":"com.modak.spiderweb.crawlers.HiveCrawler",
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$",
+            "template_group":"refresh_queries_crawler|crawler",
+            "template_name":"getCredentialTypeId"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_SAS(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:carolina:v2:libnames=(schemaName='DIRECTORY')",
+            "jdbc_url_2": "jdbc:carolina:bulk:libnames=(schemaName='DIRECTORY')",
+            "isEncrypted":"N",
+            "additional_info":$dataAsMap.additional_info$,
+            "className":"com.modak.spiderweb.crawlers.SASCrawler",
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_redshift(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:redshift://host_name/database_name",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.RedShiftCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_redshift_relational(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:redshift://host_name/database_name",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.RedShiftCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_athena(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:awsathena://region",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.AthenaCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_bigquery(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.BigQueryCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_glue(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.GlueCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_s3(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.S3Crawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_adls_gen1(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.AzureADLS1Crawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$",
+            "credential_type":"$dataAsMap.credential_type$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_adls_gen2(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.AzureADLS2Crawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$",
+            "credential_type":"$dataAsMap.credential_type$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+
+generate_initial_message_azure_blob(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data":
+      {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.AzureBlobCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$",
+            "credential_type":"$dataAsMap.credential_type$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+
+generate_initial_message_sftp(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data":{
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.SFTPCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_ftp(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data":
+      {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.FTPCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_unix(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className":"com.modak.spiderweb.crawlers.UnixCrawler",
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_unix_from_ScriptBot(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "message_topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": $templateData$,
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+          {
+            "template_group": "refresh_queries_crawler|crawler",
+            "template_name": "crawler_status_msg"
+          }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_smb(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.SMBCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+
+
+generate_initial_message_gcs(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.GCSCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_sharepoint(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMaap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.SharePointCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_teradata(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:teradata://host_name/DATABASE=database_name,DBS_PORT=port",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.TeradataCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_db2(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:db2://host_name/database_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.DB2Crawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_mongodb(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "connection_url_standard":"mongodb://username:password@host_name/database_name",
+            "connection_url_srv":"mongodb+srv://username:password@host_name/database_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.MongoDBCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_salesforce(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "dataplace_name": "$dataAsMap.dataplace_name$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.SalesforceCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_http(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "dataplace_name": "$dataAsMap.dataplace_name$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.HttpCrawler",
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_documentum(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data":
+      {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.DocumentumCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_azure_synapse(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:sqlserver://host_name;database=database_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.AzureSynapseCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_netezza(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info":{
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url":"jdbc:netezza://host_name/database_name",
+            "isEncrypted":"N",
+            "className":"com.modak.spiderweb.crawlers.NetezzaCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes":{
+            "doRollBack":true,
+            "doCrawling":true,
+            "doCDC":true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_snowflake(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic":"$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:snowflake://host_name/?db=database_name",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.SnowflakeCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+          },
+          "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+          }
+        },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_sap_hana(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic":"$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "jdbc_url": "jdbc:sap://host_name/?databaseName=database_name",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.SAPHanaCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "additional_info":$dataAsMap.additional_info$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+          },
+          "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+          }
+        },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+
+generate_initial_message_sharepoint_subsite(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMaap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data": {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "isEncrypted": "N",
+            "className": "com.modak.spiderweb.crawlers.SharepointSubsiteCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
+
+generate_initial_message_ftps(templateData,message_id,bot_id,parent_task_start_ts,parent_task_end_ts,parent_metadata,parent_bot_name,parent_task_name,dataAsMap)::=<<
+{
+  "bot_metadata": {
+    "topic": "$dataAsMap.topic$"
+  },
+  "bot_tasks": [
+    {
+      "task_name": "crawler_input",
+      "input_data":
+      {
+        "source_info": {
+            "dataplace_id": "$dataAsMap.dataplace_id$",
+            "crawl_instance_id": "$dataAsMap.crawl_instance_id$",
+            "source_info_details": $dataAsMap.source_info$,
+            "dataplace_component_type_id": "$dataAsMap.dataplace_component_type_id$",
+            "source_type": "$dataAsMap.source_type$",
+            "connection_template": "$dataAsMap.source_type$",
+            "className": "com.modak.spiderweb.crawlers.FTPSCrawler",
+            "credential_id":$dataAsMap.credential_id$,
+            "credential_type_id":$dataAsMap.credential_type_id$,
+            "is_active":"$dataAsMap.is_active$",
+            "is_sensitive":"$dataAsMap.is_sensitive$"
+        },
+        "run_attributes": {
+            "doRollBack": true,
+            "doCrawling": true,
+            "doCDC": true
+        }
+      },
+      "output_message_templates": [
+        {
+          "template_group": "refresh_queries_crawler|crawler",
+          "template_name": "crawler_status_msg"
+        }
+      ]
+    }
+  ]
+}
+>>
